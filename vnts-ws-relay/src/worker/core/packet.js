@@ -116,9 +116,9 @@ export class NetPacket {
     return (this.flags & 0x01) !== 0;    
   }    
   
-  is_gateway() {    
-    return (this.flags & 0x40) !== 0;    
-  }    
+  is_gateway() {  
+  return (this.flags & 0x04) !== 0;  
+}   
   
   incr_ttl() {    
     // 安全检查：确保数据存在    
@@ -270,10 +270,12 @@ export class NetPacket {
   const byte0 = view.getUint8(0);  
     
   if (isGateway) {  
-    view.setUint8(0, byte0 | 0x40);  // 设置网关标志  
+    view.setUint8(0, byte0 | 0x40); // 设置第6位  
   } else {  
-    view.setUint8(0, byte0 & ~0x40);  // 清除网关标志  
+    view.setUint8(0, byte0 & ~0x40); // 清除第6位  
   }  
+    
+  // 更新内部flags状态  
   this.flags = (view.getUint8(0) & 0xF0) >> 4;  
-}  
+} 
 }

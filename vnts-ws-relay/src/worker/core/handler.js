@@ -271,7 +271,7 @@ export class PacketHandler {
   
   async handleClientPacket(context, packet, addr) {  
   if (!context.link_context) {  
-    // 处理已知协议  
+    // 处理服务协议  
     if (packet.protocol === PROTOCOL.SERVICE) {  
       switch (packet.transportProtocol) {  
         case TRANSPORT_PROTOCOL.HandshakeRequest:  
@@ -281,26 +281,11 @@ export class PacketHandler {
         default:  
           break;  
       }  
-    } else if (packet.protocol === PROTOCOL.CONTROL) {  
-      if (packet.transportProtocol === TRANSPORT_PROTOCOL.AddrRequest) {  
-        return this.handleAddrRequest(addr);  
-      }  
     }  
-      
-    // 对未知包发送握手响应，引导客户端  
-    const response = this.createHandshakeResponse({  
-      version: "1.0.0",  
-      secret: false,  
-      key_finger: ""  
-    });  
-      
-    // 设置响应的目标地址  
-    response.set_destination(packet.source);  
-    response.set_source(this.serverPeerId);  
-      
-    return response;  
+    // 移除默认握手响应，改为错误响应  
+    return this.createErrorPacket(addr, packet.source, 'Invalid packet sequence');  
   }  
-      
+    
   return await this.forwardPacket(context.link_context, packet);  
 }
   
