@@ -28,56 +28,64 @@ export class PacketHandler {
   }  
 }  
   
-  async handleServerPacket(context, packet, addr, tcpSender) {
-  	console.log(`[DEBUG] handleServerPacket: protocol=${packet.protocol}, transport=${packet.transportProtocol}`);  
-    const source = packet.source;    
+  async handleServerPacket(context, packet, addr, tcpSender) {  
+  console.log(`[DEBUG] handleServerPacket: protocol=${packet.protocol}, transport=${packet.transportProtocol}`);    
+  const source = packet.source;  
   
-    // 处理服务协议 - 握手请求直接处理    
-    if (packet.protocol === PROTOCOL.SERVICE) {
-    	console.log(`[DEBUG] SERVICE protocol detected, checking transport=${packet.transportProtocol}`); 
-      switch (packet.transportProtocol) {    
-        case TRANSPORT_PROTOCOL.HandshakeRequest:    
-          return await this.handleHandshake(packet, addr);    
-            
-        case TRANSPORT_PROTOCOL.SecretHandshakeRequest:    
-          return await this.handleSecretHandshake(context, packet, addr);    
-            
-        case TRANSPORT_PROTOCOL.RegistrationRequest:    
-          return await this.handleRegistration(context, packet, addr, tcpSender);    
-            
-        default:    
-          break;    
-      }    
-    }    
+  // 处理服务协议 - 握手请求直接处理      
+  if (packet.protocol === PROTOCOL.SERVICE) {  
+    console.log(`[DEBUG] SERVICE protocol detected, checking transport=${packet.transportProtocol}`);   
+    switch (packet.transportProtocol) {      
+      case TRANSPORT_PROTOCOL.HandshakeRequest:      
+        return await this.handleHandshake(packet, addr);      
+          
+      case TRANSPORT_PROTOCOL.SecretHandshakeRequest:      
+        return await this.handleSecretHandshake(context, packet, addr);      
+          
+      case TRANSPORT_PROTOCOL.RegistrationRequest:      
+        return await this.handleRegistration(context, packet, addr, tcpSender);      
+          
+      default:      
+        break;      
+    }      
+  }  
   
-    // 解密处理    
-    const serverSecret = packet.is_encrypt();    
-    if (serverSecret) {    
-      if (context.server_cipher) {    
-        try {    
-          context.server_cipher.decrypt_ipv4(packet);    
-        } catch (error) {    
-          console.error('Decryption failed:', error);    
-          return this.createErrorPacket(addr, source, 'Decryption failed');    
-        }    
-      } else {    
-        console.log('No cipher available for encrypted packet');    
-        return this.createErrorPacket(addr, source, 'No key');    
-      }    
-    }    
+  // 新增：处理 CONTROL 协议的握手请求  
+  if (packet.protocol === PROTOCOL.CONTROL) {  
+    if (packet.transportProtocol === TRANSPORT_PROTOCOL.HandshakeRequest) {  
+      console.log(`[DEBUG] CONTROL HandshakeRequest detected, handling...`);  
+      return await this.handleHandshake(packet, addr);  
+    }  
+  }  
   
-    // 处理解密后的包    
-    let response = await this.handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret);    
+  // 解密处理      
+  const serverSecret = packet.is_encrypt();      
+  if (serverSecret) {      
+    if (context.server_cipher) {      
+      try {      
+        context.server_cipher.decrypt_ipv4(packet);      
+      } catch (error) {      
+        console.error('Decryption failed:', error);      
+        return this.createErrorPacket(addr, source, 'Decryption failed');      
+      }      
+    } else {      
+      console.log('No cipher available for encrypted packet');      
+      return this.createErrorPacket(addr, source, 'No key');      
+    }      
+  }      
+  
+  // 处理解密后的包      
+  let response = await this.handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret);      
         
-    if (response) {    
-      this.setCommonParams(response, source);    
-      if (serverSecret && context.server_cipher) {    
-        context.server_cipher.encrypt_ipv4(response);    
-      }    
-    }    
+  if (response) {      
+    this.setCommonParams(response, source);      
+    if (serverSecret && context.server_cipher) {      
+      context.server_cipher.encrypt_ipv4(response);      
+    }      
+  }      
         
-    return response;    
-  }    
+  return response;      
+}    
   
   async handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret) {    
     // 如果没有链接上下文，处理基础协议    
@@ -367,23 +375,24 @@ export class PacketHandler {
   }  
 }   
   
-  createHandshakeResponse(request) {    
-    const responseData = {    
-      version: "1.0.0",    
-      key_finger: new Uint8Array(32),    
-      public_key: new Uint8Array(0),    
-      secret: false    
-    };    
+  createHandshakeResponse(request) {  
+  const responseData = {      
+    version: "vnts_cloudflare",  
+    key_finger: new Uint8Array(32).fill(0),   
+    public_key: new Uint8Array(0),      
+    secret: false   
+  };    
+    
+  const responseBytes = this.encodeHandshakeResponse(responseData);      
+  const response = NetPacket.new_encrypt(responseBytes.length + ENCRYPTION_RESERVED);      
         
-    const responseBytes = this.encodeHandshakeResponse(responseData);    
-    const response = NetPacket.new_encrypt(responseBytes.length + ENCRYPTION_RESERVED);    
+  // 修改回：使用 SERVICE 协议  
+  response.set_protocol(PROTOCOL.SERVICE);      
+  response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);      
+  response.set_payload(responseBytes);      
         
-    response.set_protocol(PROTOCOL.SERVICE);    
-    response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);    
-    response.set_payload(responseBytes);    
-        
-    return response;    
-  }    
+  return response;      
+}    
   
   createRegistrationResponse(virtualIp, networkInfo) {    
     const responseData = {    
