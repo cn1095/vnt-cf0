@@ -130,15 +130,17 @@ export class PacketHandler {
     const payload = packet.payload();  
     const handshakeReq = this.parseHandshakeRequest(payload);  
       
+    console.log(`[DEBUG] Client handshake request:`, handshakeReq);  
+      
+    // 修复：使用客户端请求的信息创建响应  
     const response = this.createHandshakeResponse(handshakeReq);  
       
     // 设置通用参数  
     this.setCommonParams(response, packet.source);  
       
-    // 修复：使用属性访问而不是方法调用  
     console.log(`[DEBUG] After setCommonParams - source: ${response.source}, dest: ${response.destination}`);  
-      
     console.log(`[DEBUG] === HANDSHAKE END ===`);  
+      
     return response;  
   } catch (error) {  
     console.error('[DEBUG] Handshake error:', error);  
@@ -218,24 +220,27 @@ export class PacketHandler {
     }    
   }    
   
-  handlePing(packet, linkContext) {    
-    const responseSize = 12 + 4 + ENCRYPTION_RESERVED;    
-    const response = NetPacket.new_encrypt(responseSize);    
-        
-    response.set_protocol(PROTOCOL.CONTROL);    
-    response.set_transport_protocol(TRANSPORT_PROTOCOL.Pong);    
-        
-    // 复制 ping 负载    
-    const payload = packet.payload();    
-    response.set_payload(payload.slice(0, 12));    
-        
-    // 设置 epoch    
-    const pongPayload = response.payload_mut();    
-    const view = new DataView(pongPayload.buffer, pongPayload.byteOffset);    
-    view.setUint16(12, linkContext.network_info.epoch & 0xFFFF, true);    
-        
-    return response;    
-  }    
+  handlePing(packet, linkContext) {  
+  console.log(`[DEBUG] Handling ping packet`);  
+    
+  const responseSize = 12 + 4 + ENCRYPTION_RESERVED;  
+  const response = NetPacket.new_encrypt(responseSize);  
+    
+  response.set_protocol(PROTOCOL.CONTROL);  
+  response.set_transport_protocol(TRANSPORT_PROTOCOL.Pong);  
+    
+  // 复制 ping 负载  
+  const payload = packet.payload();  
+  response.set_payload(payload.slice(0, 12));  
+    
+  // 设置 epoch  
+  const pongPayload = response.payload_mut();  
+  const view = new DataView(pongPayload.buffer, pongPayload.byteOffset);  
+  view.setUint16(12, linkContext.network_info.epoch & 0xFFFF, true);  
+    
+  console.log(`[DEBUG] Pong response created, epoch: ${linkContext.network_info.epoch}`);  
+  return response;  
+}    
   
   handleAddrRequest(addr) {    
     const responseSize = 6 + ENCRYPTION_RESERVED;    
@@ -351,13 +356,27 @@ export class PacketHandler {
   }    
   
   // 辅助方法    
-  setCommonParams(packet, source) {    
-    packet.set_source(this.serverPeerId);    
-    packet.set_destination(source);    
-  }    
+  setCommonParams(packet, source) {  
+  packet.set_source(this.serverPeerId);  // 10000001  
+    
+  // 修复：使用客户端的源地址而不是虚拟IP  
+  // 在握手阶段，使用客户端发送的源地址  
+  packet.set_destination(source);  
+    
+  console.log(`[DEBUG] Set common params - source: ${this.serverPeerId}, dest: ${source}`);  
+}  
+  
+// 新增：计算客户端地址的方法  
+calculateClientAddress(source) {  
+  // 根据原始实现，客户端地址应该基于某种算法计算  
+  // 这里暂时使用 source，但可能需要根据实际协议调整  
+  return source;  
+}    
   
   createErrorPacket(addr, destination, message) {  
   try {  
+    console.log(`[DEBUG] Creating error packet: ${message}`);  
+      
     const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
       
     // 设置协议字段  
@@ -365,33 +384,51 @@ export class PacketHandler {
     errorPacket.set_destination(destination);  
     errorPacket.set_source(this.serverPeerId);  
       
+    // 尝试设置错误消息（如果协议支持）  
+    try {  
+      const errorPayload = new TextEncoder().encode(message.substring(0, 100)); // 限制长度  
+      errorPacket.set_payload(errorPayload);  
+    } catch (payloadError) {  
+      console.warn(`[DEBUG] Failed to set error payload:`, payloadError);  
+    }  
+      
     return errorPacket;  
   } catch (error) {  
     console.error('Failed to create error packet:', error);  
     // 返回一个基本的错误包  
     const fallbackPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
+    fallbackPacket.set_protocol(PROTOCOL.ERROR);  
+    fallbackPacket.set_source(this.serverPeerId);  
     return fallbackPacket;  
   }  
-}   
+}  
   
   createHandshakeResponse(request) {  
-  const responseData = {
-    version: "vnts_cloudflare",
-    key_finger: "",
-    public_key: new Uint8Array(0),   
-    secret: false
-  };
+  // 使用客户端请求的版本号  
+  const clientVersion = request.version || "1.2.16";  
     
-  const responseBytes = this.encodeHandshakeResponse(responseData);      
-  const response = NetPacket.new_encrypt(responseBytes.length + ENCRYPTION_RESERVED);      
-        
-  // 使用 SERVICE 协议  
-  response.set_protocol(PROTOCOL.SERVICE);      
-  response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);      
-  response.set_payload(responseBytes);      
-        
-  return response;      
-}    
+  const responseData = {  
+    version: clientVersion,  // 匹配客户端版本  
+    secret: false,           // 与客户端请求一致  
+    public_key: new Uint8Array(0),     
+    key_finger: ""  
+  };  
+    
+  console.log(`[DEBUG] Creating handshake response with version: ${clientVersion}`);  
+    
+  const responseBytes = this.encodeHandshakeResponse(responseData);        
+  const response = NetPacket.new_encrypt(responseBytes.length + ENCRYPTION_RESERVED);  
+          
+  // 关键：使用 SERVICE 协议而不是 CONTROL  
+  response.set_protocol(PROTOCOL.SERVICE);      // 必须是 0  
+  response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);        
+  response.set_payload(responseBytes);  
+    
+  console.log(`[DEBUG] Handshake response created, length: ${responseBytes.length}`);  
+  console.log(`[DEBUG] Response hex: ${Array.from(responseBytes).map(b => b.toString(16).padStart(2, '0')).join('')}`);  
+          
+  return response;        
+}
   
   createRegistrationResponse(virtualIp, networkInfo) {    
     const responseData = {    
@@ -518,5 +555,35 @@ export class PacketHandler {
     }    
       
     return currentIp;    
-  }    
+  } 
+  validatePacket(packet) {  
+  const buffer = packet.buffer();  
+    
+  // 修复：确保转换为 ArrayBuffer  
+  let arrayBuffer;  
+  if (buffer instanceof ArrayBuffer) {  
+    arrayBuffer = buffer;  
+  } else if (buffer.buffer) {  
+    arrayBuffer = buffer.buffer;  
+  } else {  
+    arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);  
+  }  
+    
+  const view = new DataView(arrayBuffer);  
+    
+  console.log(`[DEBUG] Complete packet hex:`, Array.from(buffer).map(b => b.toString(16).padStart(2, '0')).join(''));  
+    
+  // 验证地址字段  
+  const sourceBytes = [  
+    view.getUint8(4), view.getUint8(5),   
+    view.getUint8(6), view.getUint8(7)  
+  ];  
+  const destBytes = [  
+    view.getUint8(8), view.getUint8(9),  
+    view.getUint8(10), view.getUint8(11)  
+  ];  
+    
+  console.log(`[DEBUG] Packet source: [${sourceBytes.join(', ')}]`);  
+  console.log(`[DEBUG] Packet dest: [${destBytes.join(', ')}]`);  
+}   
 }

@@ -241,16 +241,48 @@ export class NetPacket {
     this.source = source;    
   }    
     
-  set_destination(destination) {    
-    const buffer = this._getArrayBuffer();    
-    const view = new DataView(buffer);    
-    // 大端序存储IP    
-    view.setUint8(8, (destination >> 24) & 0xFF);    
-    view.setUint8(9, (destination >> 16) & 0xFF);    
-    view.setUint8(10, (destination >> 8) & 0xFF);    
-    view.setUint8(11, destination & 0xFF);    
-    this.destination = destination;    
-  }    
+  set_destination(destination) {  
+  const buffer = this._getArrayBuffer();  
+  const view = new DataView(buffer);  
+    
+  // 关键修复：使用正确的字节顺序和偏移  
+  // VNT 协议中地址存储在字节 8-11  
+  const destBytes = this.intToIpv4Bytes(destination);  
+    
+  console.log(`[DEBUG] Setting destination bytes: [${destBytes.join(', ')}]`);  
+    
+  // 按字节设置，确保与 Rust 一致  
+  view.setUint8(8, destBytes[0]);  
+  view.setUint8(9, destBytes[1]);    
+  view.setUint8(10, destBytes[2]);  
+  view.setUint8(11, destBytes[3]);  
+    
+  this.destination = destination;  
+    
+  // 验证完整的包头  
+  const header = [];  
+  for (let i = 0; i < 12; i++) {  
+    header.push(view.getUint8(i));  
+  }  
+  console.log(`[DEBUG] Complete header: [${header.join(', ')}]`);  
+}  
+  
+set_source(source) {  
+  const buffer = this._getArrayBuffer();  
+  const view = new DataView(buffer);  
+    
+  // 源地址存储在字节 4-7  
+  const sourceBytes = this.intToIpv4Bytes(source);  
+    
+  console.log(`[DEBUG] Setting source bytes: [${sourceBytes.join(', ')}]`);  
+    
+  view.setUint8(4, sourceBytes[0]);  
+  view.setUint8(5, sourceBytes[1]);  
+  view.setUint8(6, sourceBytes[2]);  
+  view.setUint8(7, sourceBytes[3]);  
+    
+  this.source = source;  
+}    
     
   set_payload(payload) {    
     const dataStart = 12; // VNT header size    
@@ -278,4 +310,13 @@ export class NetPacket {
   // 更新内部flags状态  
   this.flags = (view.getUint8(0) & 0xF0) >> 4;  
 } 
+intToIpv4Bytes(ipInt) {  
+  return [  
+    (ipInt >> 24) & 0xFF,  
+    (ipInt >> 16) & 0xFF,   
+    (ipInt >> 8) & 0xFF,  
+    ipInt & 0xFF  
+  ];  
+}  
+
 }
