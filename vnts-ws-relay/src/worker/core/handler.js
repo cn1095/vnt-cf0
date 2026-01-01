@@ -3,6 +3,7 @@ import {
   PROTOCOL,
   TRANSPORT_PROTOCOL,
   IP_TURN_TRANSPORT_PROTOCOL,
+  ENCRYPTION_RESERVED,
 } from "./constants.js";
 import {
   VntContext,
@@ -212,22 +213,20 @@ export class PacketHandler {
       }
 
       // 检查是否是 ICMP ping 包
-      if (ipv4Packet.protocol === 1) {
-        // ICMP protocol number
-        const icmpPacket = this.parseIcmpPacket(ipv4Packet.payload);
-
-        if (icmpPacket && icmpPacket.type === 8) {
-          // Echo Request
-          // 处理 ping 请求，生成 ping 响应
-          return this.createPingResponse(
-            packet,
-            source,
-            destination,
-            ipv4Packet,
-            icmpPacket
-          );
-        }
-      }
+      if (ipv4Packet.protocol === 1 && destination === context.link_context.network_info.gateway) {  
+  const icmpPacket = this.parseIcmpPacket(ipv4Packet.payload);  
+    
+  if (icmpPacket && icmpPacket.type === 8) {  
+    // 创建 ICMP Echo Reply  
+    return this.createPingResponse(  
+      packet,  
+      source,  
+      destination,  
+      ipv4Packet,  
+      icmpPacket  
+    );  
+  }  
+}
 
       // 对于其他 IP 包，进行转发
       return await this.forwardIpPacket(context, packet, destination);
@@ -371,11 +370,25 @@ export class PacketHandler {
   }
 
   // 辅助方法：计算 IPv4 校验和
-  calculateIpv4Checksum(ipv4Packet) {
-    // 实现 IPv4 校验和计算
-    // 这里简化处理，实际需要完整的实现
-    return 0;
-  }
+  calculateIpv4Checksum(ipv4Packet) {  
+  const buffer = this.serializeIpv4Packet(ipv4Packet);  
+  let sum = 0;  
+    
+  // IPv4头部校验和（前20字节）  
+  for (let i = 0; i < 20; i += 2) {  
+    if (i + 1 < 20) {  
+      sum += (buffer[i] << 8) | buffer[i + 1];  
+    } else {  
+      sum += buffer[i] << 8;  
+    }  
+  }  
+    
+  while (sum >> 16) {  
+    sum = (sum & 0xffff) + (sum >> 16);  
+  }  
+    
+  return ~sum & 0xffff;  
+}
 
   // 辅助方法：序列化 ICMP 包
   serializeIcmpPacket(icmpPacket) {
@@ -580,6 +593,8 @@ export class PacketHandler {
       // 添加到网络
       networkInfo.clients.set(virtualIp, clientInfo);
       networkInfo.epoch += 1;
+      // 保存网络信息引用  
+this.currentNetworkInfo = networkInfo; 
 
       // 创建链接上下文
       context.link_context = {
@@ -603,51 +618,47 @@ export class PacketHandler {
     }
   }
 
-  async handlePing(packet, linkContext) {
-    // 立即处理，不经过队列
-    const currentTime = Date.now() & 0xffff; // 取低16位
+  async handlePing(packet, linkContext) {  
+  // 立即处理，不经过队列  
+  const currentTime = Date.now() & 0xffff; // 取低16位  
+  
+  // 创建 Pong 响应  
+  const pongPacket = this.createPongPacket(packet, currentTime);  
+  
+  // 返回响应包，让消息处理循环发送  
+  return pongPacket;  
+}
 
-    // 创建 Pong 响应
-    const pongPacket = this.createPongPacket(packet, currentTime);
-
-    // 直接发送响应，不经过广播
-    const sourceClient = linkContext.clients.get(packet.source.toString());
-    if (sourceClient && sourceClient.tcpSender) {
-      await sourceClient.tcpSender.send(pongPacket.buffer);
-    }
-
-    return null;
-  }
-
-  createPongPacket(pingPacket, currentTime) {
-    const headerSize = 12;
-    const payload = new Uint8Array(2); // 时间戳
-    const view = new DataView(payload.buffer);
-    view.setUint16(0, currentTime, false); // 大端序
-
-    const buffer = new Uint8Array(headerSize + payload.length);
-    buffer[0] = 2; // Version
-    buffer[1] = PROTOCOL.CONTROL;
-    buffer[2] = TRANSPORT_PROTOCOL.Pong;
-    buffer[3] = 0xf0; // MAX_TTL
-
-    // 交换源和目标
-    const sourceBytes = pingPacket.destination.split(".").map(Number);
-    const destBytes = pingPacket.source.split(".").map(Number);
-    buffer.set(sourceBytes, 4);
-    buffer.set(destBytes, 8);
-
-    buffer.set(payload, headerSize);
-
-    return {
-      protocol: PROTOCOL.CONTROL,
-      transportProtocol: TRANSPORT_PROTOCOL.Pong,
-      source: pingPacket.destination,
-      destination: pingPacket.source,
-      buffer,
-    };
-  }
-
+  createPongPacket(pingPacket, currentTime) {  
+  // 完全按照 vnts 的方式：12字节头部 + 4字节载荷 + 预留空间  
+  const totalSize = 12 + 4 + ENCRYPTION_RESERVED;  
+  const packet = NetPacket.new_encrypt(totalSize);  
+    
+  // 设置协议头  
+  packet.set_protocol(PROTOCOL.CONTROL);  
+  packet.set_transport_protocol(TRANSPORT_PROTOCOL.Pong);  
+  packet.set_source(pingPacket.destination);  
+  packet.set_destination(pingPacket.source);  
+    
+  // 关键：直接操作底层 buffer，绕过 set_payload  
+  const buffer = packet.buffer();  
+  const view = new DataView(buffer.buffer, buffer.byteOffset);  
+    
+  // 跳过12字节头部，写入4字节载荷  
+  view.setUint16(12, currentTime & 0xffff, false); // 时间戳  
+  view.setUint16(14, this.getCurrentEpoch() & 0xffff, false); // epoch  
+    
+  return packet;  
+}  
+  
+// 获取当前epoch  
+getCurrentEpoch() {  
+  // 始终使用网络信息中的epoch，如果没有则返回0  
+  if (this.currentNetworkInfo) {  
+    return this.currentNetworkInfo.epoch || 0;  
+  }  
+  return 0; // 修复：返回固定值而不是时间戳  
+}
   handleAddrRequest(addr) {
     const responseSize = 6 + ENCRYPTION_RESERVED;
     const response = NetPacket.new_encrypt(responseSize);
