@@ -1,624 +1,1056 @@
-import { NetPacket } from './packet.js';    
-import { PROTOCOL, TRANSPORT_PROTOCOL, ENCRYPTION_RESERVED } from './constants.js';    
-import { VntContext, AppCache, NetworkInfo, ClientInfo, Ipv4Addr } from './context.js';    
-import { AesGcmCipher, randomU64String } from './crypto.js';    
-  
-export class PacketHandler {    
-  constructor(env) {    
-    this.env = env;    
+import { NetPacket } from "./packet.js";
+import {
+  PROTOCOL,
+  TRANSPORT_PROTOCOL,
+  IP_TURN_TRANSPORT_PROTOCOL,
+} from "./constants.js";
+import {
+  VntContext,
+  AppCache,
+  NetworkInfo,
+  ClientInfo,
+  Ipv4Addr,
+} from "./context.js";
+import { AesGcmCipher, randomU64String } from "./crypto.js";
+
+export class PacketHandler {
+  constructor(env) {
+    this.env = env;
     this.cache = new AppCache();
     this.cache.networks = new Map();
   }
-  calculateGateway(networkInfo) {  
-  // 网关是网段的 .1 地址  
-  return (networkInfo.network & networkInfo.netmask) | 0x01;  
-}  
-  
-  async handle(context, packet, addr, tcpSender) {  
-  try {  
-    console.log(`[DEBUG] Packet routing: protocol=${packet.protocol}, transport=${packet.transportProtocol}, is_gateway=${packet.is_gateway()}`);  
-      
-    // 检查是否为网关包  
-    if (packet.is_gateway()) {  
-      console.log(`[DEBUG] Routing to handleServerPacket`);  
-      return await this.handleServerPacket(context, packet, addr, tcpSender);  
-    } else {  
-      console.log(`[DEBUG] Routing to handleClientPacket`);  
-      return await this.handleClientPacket(context, packet, addr);  
-    }  
-  } catch (error) {  
-    console.error('Packet handling error:', error);  
-    return this.createErrorPacket(addr, packet.source, error.message);  
-  }  
-}  
-  
-  async handleServerPacket(context, packet, addr, tcpSender) {  
-  console.log(`[调试] 处理服务器包: 协议=${packet.protocol}, 传输=${packet.transportProtocol}`);   
-  const source = packet.source;  
-  
-  // 处理服务协议 - 握手请求直接处理      
-  if (packet.protocol === PROTOCOL.SERVICE) {  
-    console.log(`[调试] 检测到 SERVICE 协议, 传输类型=${packet.transportProtocol}`);   
-    switch (packet.transportProtocol) {      
-      case TRANSPORT_PROTOCOL.HandshakeRequest:      
-        return await this.handleHandshake(packet, addr);      
-          
-      case TRANSPORT_PROTOCOL.SecretHandshakeRequest:
-      	console.log(`[调试] 检测到注册请求, 调用 handleRegistration`);  
-        return await this.handleSecretHandshake(context, packet, addr);      
-          
-      case TRANSPORT_PROTOCOL.RegistrationRequest:      
-        return await this.handleRegistration(context, packet, addr, tcpSender);      
-          
-      default:      
-        break;      
-    }      
-  }  
-  
-  // 新增：处理 CONTROL 协议的握手请求  
-  if (packet.protocol === PROTOCOL.CONTROL) {
-  	console.log(`[调试] 检测到 CONTROL 协议, 传输类型=${packet.transportProtocol}`);
-    if (packet.transportProtocol === TRANSPORT_PROTOCOL.HandshakeRequest) {  
-      console.log(`[DEBUG] CONTROL HandshakeRequest detected, handling...`);  
-      return await this.handleHandshake(packet, addr);  
-    }  
-  }  
-  
-  // 解密处理      
-  const serverSecret = packet.is_encrypt();      
-  if (serverSecret) {      
-    if (context.server_cipher) {      
-      try {      
-        context.server_cipher.decrypt_ipv4(packet);      
-      } catch (error) {      
-        console.error('Decryption failed:', error);      
-        return this.createErrorPacket(addr, source, 'Decryption failed');      
-      }      
-    } else {      
-      console.log('No cipher available for encrypted packet');      
-      return this.createErrorPacket(addr, source, 'No key');      
-    }      
-  }      
-  
-  // 处理解密后的包      
-  let response = await this.handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret);      
-        
-  if (response) {      
-    this.setCommonParams(response, source);      
-    if (serverSecret && context.server_cipher) {      
-      context.server_cipher.encrypt_ipv4(response);      
-    }      
-  }      
-        
-  return response;      
-}    
-  
-  async handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret) {    
-    // 如果没有链接上下文，处理基础协议    
-    if (!context.link_context) {    
-      return await this.handleNotContext(context, packet, addr, tcpSender, serverSecret);    
-    }    
-  
-    // 有链接上下文时的处理    
-    if (packet.protocol === PROTOCOL.CONTROL) {    
-      switch (packet.transportProtocol) {    
-        case TRANSPORT_PROTOCOL.Ping:    
-          return this.handlePing(packet, context.link_context);    
-            
-        default:    
-          break;    
-      }    
-    }    
-  
-    // 数据包转发处理    
-    return await this.handleDataForward(context, packet, addr, tcpSender);    
-  }    
-  
-  async handleNotContext(context, packet, addr, tcpSender, serverSecret) {    
-    if (packet.protocol === PROTOCOL.SERVICE) {    
-      if (packet.transportProtocol === TRANSPORT_PROTOCOL.RegistrationRequest) {    
-        return await this.handleRegistration(context, packet, addr, tcpSender);    
-      }    
-    } else if (packet.protocol === PROTOCOL.CONTROL) {    
-      if (packet.transportProtocol === TRANSPORT_PROTOCOL.AddrRequest) {    
-        return this.handleAddrRequest(addr);    
-      }    
-    }    
-        
-    // 返回错误，表示需要先建立上下文    
-    return this.createErrorPacket(addr, packet.source, 'No context');    
-  }    
-  
-  async handleHandshake(packet, addr) {  
-  try {  
-    console.log(`[调试] === 握手开始 ===`);  
-      
-    const payload = packet.payload();  
-    const handshakeReq = this.parseHandshakeRequest(payload);  
-      
-    console.log(`[调试] 客户端握手请求:`, handshakeReq);  
-      
-    const response = this.createHandshakeResponse(handshakeReq);  
-      
-    // 确保响应使用 SERVICE 协议  
-    response.set_protocol(PROTOCOL.SERVICE);  
-    response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);  
-      
-    // 使用默认网关  
-    const defaultGateway = 0x0A240001; // 10.36.0.1  
-    this.setCommonParams(response, packet.source, defaultGateway);  
-      
-    // 关键修复：直接修改最终缓冲区的 TTL  
-    const finalBuffer = response.buffer();  
-    const view = new DataView(finalBuffer.buffer || finalBuffer);  
-    const currentTtl = view.getUint8(3);  
-    console.log(`[调试] 发送前 TTL 检查: 0x${currentTtl.toString(16).padStart(2, '0')}`);  
-      
-    // 强制设置 TTL 为 0xff (原始TTL=15, 当前TTL=15)  
-    view.setUint8(3, 0xff);  
-    console.log(`[调试] 强制修复 TTL 为: 0xff`);  
-      
-    console.log(`[调试] 握手响应协议: ${response.protocol}, 传输: ${response.transportProtocol}`);  
-    console.log(`[调试] 握手响应网关: ${this.formatIp(defaultGateway)}`);  
-    console.log(`[调试] === 握手结束 ===`);  
-      
-    return response;  
-  } catch (error) {  
-    console.error('[调试] 握手错误:', error);  
-    return this.createErrorPacket(addr, packet.source, '握手失败');  
-  }  
-}
-
-  async handleSecretHandshake(context, packet, addr) {    
-    console.log(`Secret handshake from ${addr}`);    
-        
-    // 这里应该实现 RSA 解密和 AES 密钥交换    
-    // 简化实现，实际需要完整的加密逻辑    
-    try {    
-      const response = NetPacket.new_encrypt(ENCRYPTION_RESERVED);    
-      response.set_protocol(PROTOCOL.SERVICE);    
-      response.set_transport_protocol(TRANSPORT_PROTOCOL.SecretHandshakeResponse);    
-      this.setCommonParams(response, packet.source);    
-          
-      // 创建加密会话（简化）    
-      const cipher = new AesGcmCipher(this.generateRandomKey());    
-      context.server_cipher = cipher;    
-      this.cache.cipher_session.set(addr, cipher);    
-          
-      return response;    
-    } catch (error) {    
-      console.error('Secret handshake error:', error);    
-      return this.createErrorPacket(addr, packet.source, 'Secret handshake failed');    
-    }    
-  }    
-  
-  async handleRegistration(context, packet, addr, tcpSender) { 
-  	console.log(`[DEBUG] Registration request received`);      
-    try {      
-      const payload = packet.payload();      
-      const registrationReq = this.parseRegistrationRequest(payload);      
-            
-      // 获取客户端请求的IP    
-      const requestedIp = registrationReq.virtual_ip || 0;      
-            
-      // 创建或获取网络信息      
-      const networkInfo = this.getOrCreateNetworkInfo(registrationReq.token, requestedIp);     
-            
-      // 分配虚拟 IP - 如果客户端指定了IP就直接使用，否则分配新的  
-      const virtualIp = requestedIp !== 0 ? requestedIp : this.allocateVirtualIp(networkInfo, registrationReq.device_id); 
-      console.log(`[DEBUG] Allocated IP: ${this.formatIp(virtualIp)}, 网关: ${this.formatIp(networkInfo.gateway)}`);     
-            
-      // 创建客户端信息      
-      const clientInfo = new ClientInfo({      
-        virtual_ip: virtualIp,      
-        device_id: registrationReq.device_id,      
-        name: registrationReq.name,      
-        version: registrationReq.version,      
-        online: true,      
-        address: addr,      
-        client_secret_hash: registrationReq.client_secret_hash,      
-        tcp_sender: tcpSender,      
-        timestamp: Date.now()      
-      });      
-            
-      // 添加到网络      
-      networkInfo.clients.set(virtualIp, clientInfo);      
-      networkInfo.epoch += 1;      
-            
-      // 创建链接上下文      
-      context.link_context = {      
-        group: registrationReq.token,      
-        virtual_ip: virtualIp,      
-        network_info: networkInfo,      
-        timestamp: Date.now()      
-      };      
-            
-      // 创建注册响应      
-      const response = this.createRegistrationResponse(virtualIp, networkInfo); 
-      console.log(`[DEBUG] Sending registration response: IP=${this.formatIp(virtualIp)}, Gateway=${this.formatIp(networkInfo.gateway)}`);     
-      return response;      
-            
-    } catch (error) {      
-      console.error('Registration error:', error);      
-      return this.createErrorPacket(addr, packet.source, 'Registration failed');      
-    }      
+  calculateGateway(networkInfo) {
+    // 网关是网段的 .1 地址
+    return (networkInfo.network & networkInfo.netmask) | 0x01;
   }
-  
-  handlePing(packet, linkContext) {  
-  console.log(`[DEBUG] Handling ping packet`);  
-    
-  // 完全模仿vnts服务端的实现  
-  const responseSize = 12 + 4 + ENCRYPTION_RESERVED;  
-  const response = NetPacket.new_encrypt(responseSize);  
-    
-  response.set_protocol(PROTOCOL.CONTROL);  
-  response.set_transport_protocol(TRANSPORT_PROTOCOL.Pong);  
-    
-  // 完整复制，不做任何修改  
-  const payload = packet.payload();  
-  response.set_payload(payload);  
-    
-  // 不手动设置epoch，让客户端处理  
-  console.log(`[DEBUG] Pong response created`);  
-  return response;  
-}
-  
-  handleAddrRequest(addr) {    
-    const responseSize = 6 + ENCRYPTION_RESERVED;    
-    const response = NetPacket.new_encrypt(responseSize);    
-        
-    response.set_protocol(PROTOCOL.CONTROL);    
-    response.set_transport_protocol(TRANSPORT_PROTOCOL.AddrResponse);    
-        
-    // 设置地址信息    
-    const addrPayload = response.payload_mut();    
-    const view = new DataView(addrPayload.buffer, addrPayload.byteOffset);    
-        
-    // 解析 IPv4 地址    
-    const ipv4 = this.parseIpv4(addr.ip);    
-    view.setUint32(0, ipv4, true);    
-    view.setUint16(4, addr.port || 0, true);    
-        
-    return response;    
-  }    
-  
-  async handleDataForward(context, packet, addr, tcpSender) {    
-    // 增加 TTL    
-    if (packet.incr_ttl() > 1) {    
-      // 检查是否禁用中继    
-      if (this.env.VNT_DISABLE_RELAY === '1') {    
-        console.log('Relay disabled, dropping packet');    
-        return null;    
-      }    
-          
-      const destination = packet.destination;    
-          
-      if (this.isBroadcast(destination)) {    
-        return await this.broadcastPacket(context.link_context, packet);    
-      } else {    
-        return await this.forwardToDestination(context.link_context, packet, destination);    
-      }    
-    }    
-    return null;    
-  }    
-  
-  async handleClientPacket(context, packet, addr) {  
-  if (!context.link_context) {  
-    // 处理服务协议  
-    if (packet.protocol === PROTOCOL.SERVICE) {  
-      switch (packet.transportProtocol) {  
-        case TRANSPORT_PROTOCOL.HandshakeRequest:  
-          return await this.handleHandshake(packet, addr);  
-        case TRANSPORT_PROTOCOL.RegistrationRequest:  
-          return await this.handleRegistration(context, packet, addr, null);  
-        default:  
-          break;  
-      }  
-    }  
-    // 移除默认握手响应，改为错误响应  
-    return this.createErrorPacket(addr, packet.source, 'Invalid packet sequence');  
-  }  
-    
-  return await this.forwardPacket(context.link_context, packet);  
-}
-  
-  async forwardPacket(linkContext, packet) {    
-    const destination = packet.destination;    
-        
-    if (this.isBroadcast(destination)) {    
-      return await this.broadcastPacket(linkContext, packet);    
-    } else {    
-      const targetClient = linkContext.network_info.clients.get(destination);    
-      if (targetClient && targetClient.online && targetClient.tcp_sender) {    
-        // 发送到特定客户端    
-        try {    
-          await targetClient.tcp_sender.send(packet.buffer().to_vec());    
-        } catch (error) {    
-          console.error('Forward failed:', error);    
-          targetClient.online = false;    
-        }    
-      }    
-    }    
-    return null;    
-  }    
-  
-  async broadcastPacket(linkContext, packet) {    
-    const networkInfo = linkContext.network_info;    
-    const sender = packet.source;    
-        
-    for (const [virtualIp, client] of networkInfo.clients) {    
-      if (client.virtual_ip !== sender && client.online && client.tcp_sender) {    
-        try {    
-          await client.tcp_sender.send(packet.buffer().to_vec());    
-        } catch (error) {    
-          console.error(`Broadcast to ${virtualIp} failed:`, error);    
-          client.online = false;    
-        }    
-      }    
-    }    
-    return null;    
-  }    
-  
-  async forwardToDestination(linkContext, packet, destination) {    
-    const targetClient = linkContext.network_info.clients.get(destination);    
-    if (targetClient && targetClient.online && targetClient.tcp_sender) {    
-      try {    
-        await targetClient.tcp_sender.send(packet.buffer().to_vec());    
-      } catch (error) {    
-        console.error(`Forward to ${destination} failed:`, error);    
-        targetClient.online = false;    
-      }    
-    }    
-    return null;    
-  }    
-  
-  async leave(context) {    
-    await context.leave(this.cache);    
-  }    
-  
-  // 辅助方法    
-  setCommonParams(packet, source, gateway) {  
-  packet.set_default_version();  
-  packet.set_destination(source);  
-  packet.set_source(0x0A240001); 
-  packet.first_set_ttl(15);    // MAX_TTL = 0b1111 = 15  
-  packet.set_gateway_flag(true);  
-}  
-  
-// 新增：计算客户端地址的方法  
-calculateClientAddress(source) {  
-  // 根据原始实现，客户端地址应该基于某种算法计算  
-  // 这里暂时使用 source，但可能需要根据实际协议调整  
-  return source;  
-}    
-  
-  createErrorPacket(addr, destination, message) {  
-  try {  
-    console.log(`[DEBUG] Creating error packet: ${message}`);  
-      
-    const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
-      
-    // 设置协议字段  
-    errorPacket.set_protocol(PROTOCOL.ERROR);  
-    errorPacket.set_destination(destination);  
-    errorPacket.set_source(this.serverPeerId);  
-      
-    // 尝试设置错误消息（如果协议支持）  
-    try {  
-      const errorPayload = new TextEncoder().encode(message.substring(0, 100)); // 限制长度  
-      errorPacket.set_payload(errorPayload);  
-    } catch (payloadError) {  
-      console.warn(`[DEBUG] Failed to set error payload:`, payloadError);  
-    }  
-      
-    return errorPacket;  
-  } catch (error) {  
-    console.error('Failed to create error packet:', error);  
-    // 返回一个基本的错误包  
-    const fallbackPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
-    fallbackPacket.set_protocol(PROTOCOL.ERROR);  
-    fallbackPacket.set_source(this.serverPeerId);  
-    return fallbackPacket;  
-  }  
-}  
-  
-  createHandshakeResponse(request) {  
-  const clientVersion = request.version || "1.2.16";  
-    
-  const responseData = {  
-    version: clientVersion,  
-    secret: false,  
-    public_key: new Uint8Array(0),       
-    key_finger: ""  
-  };  
-    
-  const responseBytes = this.encodeHandshakeResponse(responseData);  
-    
-  // 使用普通数据包而不是加密数据包  
-  const response = NetPacket.new(responseBytes.length);  
-    
-  response.set_protocol(PROTOCOL.SERVICE);  
-  response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);  
-  response.set_payload(responseBytes);  
-    
-  return response;  
-}
-  
-  createRegistrationResponse(virtualIp, networkInfo) {  
-  const responseData = {  
-    virtual_ip: virtualIp,  
-    virtual_gateway: networkInfo.gateway,  
-    virtual_netmask: networkInfo.netmask,  
-    epoch: networkInfo.epoch,  
-    // 修复：过滤掉未完全初始化的客户端  
-    device_info_list: Array.from(networkInfo.clients.values())  
-      .filter(client => client.virtual_ip !== 0 && client.online)  // 只显示有效IP的在线客户端  
-      .map(client => ({  
-        name: client.name,  
-        virtual_ip: client.virtual_ip,  
-        device_status: client.online ? 1 : 0,  
-        client_secret: false,  
-        client_secret_hash: new Uint8Array(0),  
-        wireguard: false  
-      })),  
-    public_ip: networkInfo.public_ip,  
-    public_port: networkInfo.public_port,  
-    public_ipv6: new Uint8Array(0)  
-  };      
-        
-  const responseBytes = this.encodeRegistrationResponse(responseData);      
-  const response = NetPacket.new(responseBytes.length);   
-  response.set_default_version(); 
-        
-  response.set_protocol(PROTOCOL.SERVICE);      
-  response.set_transport_protocol(TRANSPORT_PROTOCOL.RegistrationResponse);    
-    
-  // 添加这些关键行：  
-  response.set_source(networkInfo.gateway);      // 设置源地址为网关  
-  response.set_destination(0xffffffff);          // 设置目标地址为客户端  
-  response.set_gateway_flag(true);              // 设置网关标志  
-  response.first_set_ttl(15);
-    
-  response.set_payload(responseBytes);      
-        
-  return response;      
-}  
-  
-  // 协议解析方法    
-  parseHandshakeRequest(payload) {    
-    const { parseHandshakeRequest } = require('./protos.js');    
-    try {    
-      return parseHandshakeRequest(payload);    
-    } catch (error) {    
-      console.error('Failed to parse handshake request:', error);    
-      throw new Error('Invalid handshake request format');    
-    }    
-  }    
-  
-  parseRegistrationRequest(payload) {    
-    const { parseRegistrationRequest } = require('./protos.js');    
-    try {    
-      return parseRegistrationRequest(payload);    
-    } catch (error) {    
-      console.error('Failed to parse registration request:', error);    
-      throw new Error('Invalid registration request format');    
-    }    
-  }    
-  
-  encodeHandshakeResponse(data) {  
-  const { createHandshakeResponse } = require('./protos.js');  
-  return createHandshakeResponse(data.version, data.secret, data.public_key, data.key_finger);  
-}    
-  
-  encodeRegistrationResponse(data) {    
-    const { createRegistrationResponse } = require('./protos.js');    
-    return createRegistrationResponse(    
-      data.virtual_ip,    
-      data.virtual_gateway,    
-      data.virtual_netmask,    
-      data.epoch,    
-      data.device_info_list,    
-      data.public_ip,    
-      data.public_port    
-    );    
-  }    
-  
-  validateRegistrationRequest(request) {    
-    if (!request.token || request.token.length === 0 || request.token.length > 128) {    
-      throw new Error('Invalid token length');    
-    }    
-    if (!request.device_id || request.device_id.length === 0 || request.device_id.length > 128) {    
-      throw new Error('Invalid device_id length');    
-    }    
-    if (!request.name || request.name.length === 0 || request.name.length > 128) {    
-      throw new Error('Invalid name length');    
-    }    
-  }    
-  
-  parseIpv4(ipStr) {    
-    if (!ipStr || typeof ipStr !== 'string') {    
-      return 0;    
-    }    
-    const parts = ipStr.split('.').map(Number);    
-    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];    
-  }    
-  
-  isBroadcast(addr) {    
-    return addr === 0xFFFFFFFF || addr === 0;    
-  }    
-  
-  generateRandomKey() {    
-    const array = new Uint8Array(32);    
-    crypto.getRandomValues(array);    
-    return array;    
-  }    
-  
-  // 网络管理方法    
-  getOrCreateNetworkInfo(token, requestedIp = 0) {  
-  if (!this.cache.networks.has(token)) {  
-    let gateway = 0x0A240001; // 默认 10.36.0.1  
-    let network = 0x0A240001; // 默认 10.36.0.0  
-    let netmask = 0xFFFFFF00; // 255.255.255.0  
-      
-    // 如果第一个客户端指定了IP，根据其更新网段  
-    if (requestedIp !== 0) {  
-      network = requestedIp & netmask; 
-      console.log(`[DEBUG] 客户端网段更新: 网关=${this.formatIp(gateway)}, 网络=${this.formatIp(network)}`);  
-    }  
-      
-    this.cache.networks.set(token, new NetworkInfo(network, netmask, gateway));  
-  }  
-  return this.cache.networks.get(token);  
-}  
-  
-// 辅助方法：格式化 IP 地址用于日志  
-formatIp(ipUint32) {  
-  return `${(ipUint32 >>> 24) & 0xFF}.${(ipUint32 >>> 16) & 0xFF}.${(ipUint32 >>> 8) & 0xFF}.${ipUint32 & 0xFF}`;  
-}   
-  
-  allocateVirtualIp(networkInfo, deviceId) {    
-    // 简单的 IP 分配策略：从 10.0.0.2 开始分配    
-    const baseIp = (networkInfo.network & 0xFFFFFF00) + 2;     
-    let currentIp = baseIp;    
-      
-    while (networkInfo.clients.has(currentIp)) {    
-      currentIp++;    
-      // 防止超出子网范围    
-      if ((currentIp & 0xFF) > 254) {    
-        throw new Error('No available IP addresses');    
-      }    
-    }    
-      
-    return currentIp;    
-  } 
-  validatePacket(packet) {  
-  const buffer = packet.buffer();  
-    
-  // 修复：确保转换为 ArrayBuffer  
-  let arrayBuffer;  
-  if (buffer instanceof ArrayBuffer) {  
-    arrayBuffer = buffer;  
-  } else if (buffer.buffer) {  
-    arrayBuffer = buffer.buffer;  
-  } else {  
-    arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);  
-  }  
-    
-  const view = new DataView(arrayBuffer);  
-    
-  console.log(`[DEBUG] Complete packet hex:`, Array.from(buffer).map(b => b.toString(16).padStart(2, '0')).join(''));  
-    
-  // 验证地址字段  
-  const sourceBytes = [  
-    view.getUint8(4), view.getUint8(5),   
-    view.getUint8(6), view.getUint8(7)  
-  ];  
-  const destBytes = [  
-    view.getUint8(8), view.getUint8(9),  
-    view.getUint8(10), view.getUint8(11)  
-  ];  
-    
-  console.log(`[DEBUG] Packet source: [${sourceBytes.join(', ')}]`);  
-  console.log(`[DEBUG] Packet dest: [${destBytes.join(', ')}]`);  
-}   
+
+  async handle(context, packet, addr, tcpSender) {
+    try {
+      console.log(
+        `[DEBUG] Packet routing: protocol=${packet.protocol}, transport=${
+          packet.transportProtocol
+        }, is_gateway=${packet.is_gateway()}`
+      );
+
+      // 检查是否为网关包
+      if (packet.is_gateway()) {
+        console.log(`[DEBUG] Routing to handleServerPacket`);
+        return await this.handleServerPacket(context, packet, addr, tcpSender);
+      } else {
+        console.log(`[DEBUG] Routing to handleClientPacket`);
+        return await this.handleClientPacket(context, packet, addr);
+      }
+    } catch (error) {
+      console.error("Packet handling error:", error);
+      return this.createErrorPacket(addr, packet.source, error.message);
+    }
+  }
+
+  async handleServerPacket(context, packet, addr, tcpSender) {
+    console.log(
+      `[调试] 处理服务器包: 协议=${packet.protocol}, 传输=${packet.transportProtocol}`
+    );
+    const source = packet.source;
+
+    // 处理服务协议 - 握手请求直接处理
+    if (packet.protocol === PROTOCOL.SERVICE) {
+      console.log(
+        `[调试] 检测到 SERVICE 协议, 传输类型=${packet.transportProtocol}`
+      );
+      switch (packet.transportProtocol) {
+        case TRANSPORT_PROTOCOL.HandshakeRequest:
+          return await this.handleHandshake(packet, addr);
+
+        case TRANSPORT_PROTOCOL.SecretHandshakeRequest:
+          console.log(`[调试] 检测到注册请求, 调用 handleRegistration`);
+          return await this.handleSecretHandshake(context, packet, addr);
+
+        case TRANSPORT_PROTOCOL.RegistrationRequest:
+          return await this.handleRegistration(
+            context,
+            packet,
+            addr,
+            tcpSender
+          );
+
+        default:
+          break;
+      }
+    }
+
+    // 新增：处理 CONTROL 协议的握手请求
+    if (packet.protocol === PROTOCOL.CONTROL) {
+      console.log(
+        `[调试] 检测到 CONTROL 协议, 传输类型=${packet.transportProtocol}`
+      );
+      if (packet.transportProtocol === TRANSPORT_PROTOCOL.HandshakeRequest) {
+        console.log(`[DEBUG] CONTROL HandshakeRequest detected, handling...`);
+        return await this.handleHandshake(packet, addr);
+      }
+    }
+
+    // 解密处理
+    const serverSecret = packet.is_encrypt();
+    if (serverSecret) {
+      if (context.server_cipher) {
+        try {
+          context.server_cipher.decrypt_ipv4(packet);
+        } catch (error) {
+          console.error("Decryption failed:", error);
+          return this.createErrorPacket(addr, source, "Decryption failed");
+        }
+      } else {
+        console.log("No cipher available for encrypted packet");
+        return this.createErrorPacket(addr, source, "No key");
+      }
+    }
+
+    // 处理解密后的包
+    let response = await this.handleDecryptedPacket(
+      context,
+      packet,
+      addr,
+      tcpSender,
+      serverSecret
+    );
+
+    if (response) {
+      this.setCommonParams(response, source);
+      if (serverSecret && context.server_cipher) {
+        context.server_cipher.encrypt_ipv4(response);
+      }
+    }
+
+    return response;
+  }
+
+  async handleDecryptedPacket(context, packet, addr, tcpSender, serverSecret) {
+    // 如果没有链接上下文，处理基础协议
+    if (!context.link_context) {
+      return await this.handleNotContext(
+        context,
+        packet,
+        addr,
+        tcpSender,
+        serverSecret
+      );
+    }
+
+    // 有链接上下文时的处理
+    if (packet.protocol === PROTOCOL.CONTROL) {
+      switch (packet.transportProtocol) {
+        case TRANSPORT_PROTOCOL.Ping:
+          return this.handlePing(packet, context.link_context);
+
+        default:
+          break;
+      }
+    }
+
+    // 新增：处理 IpTurn 协议
+    if (packet.protocol === PROTOCOL.IPTURN) {
+      return await this.handleIpTurn(
+        context,
+        packet,
+        addr,
+        tcpSender,
+        serverSecret
+      );
+    }
+
+    // 数据包转发处理
+    return await this.handleDataForward(context, packet, addr, tcpSender);
+  }
+
+  // 新增：IpTurn 协议处理
+  async handleIpTurn(context, packet, addr, tcpSender, serverSecret) {
+    const destination = packet.destination;
+    const source = packet.source;
+
+    switch (packet.transportProtocol) {
+      case IP_TURN_TRANSPORT_PROTOCOL.Ipv4:
+        return await this.handleIpv4Packet(
+          context,
+          packet,
+          source,
+          destination,
+          addr,
+          tcpSender,
+          serverSecret
+        );
+
+      case IP_TURN_TRANSPORT_PROTOCOL.WGIpv4:
+        // WireGuard 数据包转发
+        return await this.handleWgIpv4(context, packet, destination);
+
+      case IP_TURN_TRANSPORT_PROTOCOL.Ipv4Broadcast:
+        // 广播包处理
+        return await this.handleIpv4Broadcast(context, packet);
+
+      default:
+        break;
+    }
+  }
+
+  // 处理 IPv4 数据包（包括 ICMP ping）
+  async handleIpv4Packet(
+    context,
+    packet,
+    source,
+    destination,
+    addr,
+    tcpSender,
+    serverSecret
+  ) {
+    try {
+      // 解析 IPv4 包
+      const ipv4Data = packet.payload;
+      const ipv4Packet = this.parseIpv4Packet(ipv4Data);
+
+      if (!ipv4Packet) {
+        return null;
+      }
+
+      // 检查是否是 ICMP ping 包
+      if (ipv4Packet.protocol === 1) {
+        // ICMP protocol number
+        const icmpPacket = this.parseIcmpPacket(ipv4Packet.payload);
+
+        if (icmpPacket && icmpPacket.type === 8) {
+          // Echo Request
+          // 处理 ping 请求，生成 ping 响应
+          return this.createPingResponse(
+            packet,
+            source,
+            destination,
+            ipv4Packet,
+            icmpPacket
+          );
+        }
+      }
+
+      // 对于其他 IP 包，进行转发
+      return await this.forwardIpPacket(context, packet, destination);
+    } catch (error) {
+      console.error("处理 IPv4 包失败:", error);
+      return null;
+    }
+  }
+
+  // 创建 ping 响应
+  createPingResponse(
+    originalPacket,
+    source,
+    destination,
+    ipv4Packet,
+    icmpPacket
+  ) {
+    // 响应的 ICMP 包
+    const responseIcmp = {
+      type: 0, // Echo Reply
+      code: 0,
+      checksum: 0,
+      identifier: icmpPacket.identifier,
+      sequenceNumber: icmpPacket.sequenceNumber,
+      data: icmpPacket.data,
+    };
+
+    // 计算校验和
+    responseIcmp.checksum = this.calculateIcmpChecksum(responseIcmp);
+
+    // 响应的 IPv4 包
+    const responseIpv4 = {
+      version: 4,
+      headerLength: 5,
+      totalLength: 20 + responseIcmp.data.length,
+      identification: ipv4Packet.identification,
+      flags: 0,
+      fragmentOffset: 0,
+      ttl: 64,
+      protocol: 1, // ICMP
+      headerChecksum: 0,
+      sourceIp: destination,
+      destIp: source,
+      payload: this.serializeIcmpPacket(responseIcmp),
+    };
+
+    // 计算 IPv4 校验和
+    responseIpv4.headerChecksum = this.calculateIpv4Checksum(responseIpv4);
+
+    // 创建 VNT 协议包
+    const responsePacket = this.createVntPacket(
+      PROTOCOL.IPTURN,
+      IP_TURN_TRANSPORT_PROTOCOL.Ipv4,
+      destination, // source becomes destination
+      source, // destination becomes source
+      this.serializeIpv4Packet(responseIpv4)
+    );
+
+    return responsePacket;
+  }
+
+  // 转发 IP 包到目标客户端
+  async forwardIpPacket(context, packet, destination) {
+    // 查找目标客户端
+    const targetClient = context.link_context.clients.get(
+      destination.toString()
+    );
+
+    if (!targetClient || !targetClient.online) {
+      console.log(`目标客户端 ${destination} 不在线或不存在`);
+      return null;
+    }
+
+    // 转发到目标客户端
+    if (targetClient.tcpSender) {
+      await targetClient.tcpSender.send(packet.buffer);
+    } else {
+      // UDP 转发
+      await this.udp.send(packet.buffer, targetClient.address);
+    }
+
+    return null;
+  }
+
+  // 辅助方法：解析 IPv4 包
+  parseIpv4Packet(data) {
+    if (data.length < 20) return null;
+
+    const version = (data[0] >> 4) & 0x0f;
+    if (version !== 4) return null;
+
+    const headerLength = (data[0] & 0x0f) * 4;
+    const totalLength = (data[2] << 8) | data[3];
+    const protocol = data[9];
+    const sourceIp = `${data[12]}.${data[13]}.${data[14]}.${data[15]}`;
+    const destIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+
+    return {
+      version,
+      headerLength,
+      totalLength,
+      protocol,
+      sourceIp,
+      destIp,
+      payload: data.slice(headerLength),
+    };
+  }
+
+  // 辅助方法：解析 ICMP 包
+  parseIcmpPacket(data) {
+    if (data.length < 8) return null;
+
+    return {
+      type: data[0],
+      code: data[1],
+      checksum: (data[2] << 8) | data[3],
+      identifier: (data[4] << 8) | data[5],
+      sequenceNumber: (data[6] << 8) | data[7],
+      data: data.slice(8),
+    };
+  }
+
+  // 辅助方法：计算 ICMP 校验和
+  calculateIcmpChecksum(icmpPacket) {
+    const data = this.serializeIcmpPacket(icmpPacket);
+    let sum = 0;
+
+    for (let i = 0; i < data.length; i += 2) {
+      if (i + 1 < data.length) {
+        sum += (data[i] << 8) | data[i + 1];
+      } else {
+        sum += data[i] << 8;
+      }
+    }
+
+    while (sum >> 16) {
+      sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    return ~sum & 0xffff;
+  }
+
+  // 辅助方法：计算 IPv4 校验和
+  calculateIpv4Checksum(ipv4Packet) {
+    // 实现 IPv4 校验和计算
+    // 这里简化处理，实际需要完整的实现
+    return 0;
+  }
+
+  // 辅助方法：序列化 ICMP 包
+  serializeIcmpPacket(icmpPacket) {
+    const buffer = new Uint8Array(8 + icmpPacket.data.length);
+    buffer[0] = icmpPacket.type;
+    buffer[1] = icmpPacket.code;
+    buffer[2] = (icmpPacket.checksum >> 8) & 0xff;
+    buffer[3] = icmpPacket.checksum & 0xff;
+    buffer[4] = (icmpPacket.identifier >> 8) & 0xff;
+    buffer[5] = icmpPacket.identifier & 0xff;
+    buffer[6] = (icmpPacket.sequenceNumber >> 8) & 0xff;
+    buffer[7] = icmpPacket.sequenceNumber & 0xff;
+    buffer.set(icmpPacket.data, 8);
+    return buffer;
+  }
+
+  // 辅助方法：序列化 IPv4 包
+  serializeIpv4Packet(ipv4Packet) {
+    const buffer = new Uint8Array(ipv4Packet.totalLength);
+    buffer[0] = (ipv4Packet.version << 4) | (ipv4Packet.headerLength / 4);
+    buffer[1] = 0; // DSCP/ECN
+    buffer[2] = (ipv4Packet.totalLength >> 8) & 0xff;
+    buffer[3] = ipv4Packet.totalLength & 0xff;
+    buffer[4] = (ipv4Packet.identification >> 8) & 0xff;
+    buffer[5] = ipv4Packet.identification & 0xff;
+    buffer[6] = (ipv4Packet.flags >> 13) & 0xff;
+    buffer[7] = ipv4Packet.flags & 0xff;
+    buffer[8] = ipv4Packet.ttl;
+    buffer[9] = ipv4Packet.protocol;
+    buffer[10] = (ipv4Packet.headerChecksum >> 8) & 0xff;
+    buffer[11] = ipv4Packet.headerChecksum & 0xff;
+
+    // IP 地址
+    const sourceBytes = ipv4Packet.sourceIp.split(".").map(Number);
+    const destBytes = ipv4Packet.destIp.split(".").map(Number);
+    buffer.set(sourceBytes, 12);
+    buffer.set(destBytes, 16);
+
+    // 载荷
+    buffer.set(ipv4Packet.payload, ipv4Packet.headerLength);
+
+    return buffer;
+  }
+
+  // 辅助方法：创建 VNT 协议包
+  createVntPacket(protocol, transportProtocol, source, destination, payload) {
+    const headerSize = 12;
+    const buffer = new Uint8Array(headerSize + payload.length);
+
+    // VNT 头部
+    const view = new DataView(buffer.buffer);
+    view.setUint8(0, 2); // Version
+    view.setUint8(1, protocol);
+    view.setUint8(2, transportProtocol);
+    view.setUint8(3, 0x60); // TTL (6)
+
+    // 源和目标 IP
+    const sourceBytes = source.split(".").map(Number);
+    const destBytes = destination.split(".").map(Number);
+    buffer.set(sourceBytes, 4);
+    buffer.set(destBytes, 8);
+
+    // 载荷
+    buffer.set(payload, headerSize);
+
+    return {
+      protocol,
+      transportProtocol,
+      source,
+      destination,
+      buffer,
+    };
+  }
+
+  async handleNotContext(context, packet, addr, tcpSender, serverSecret) {
+    if (packet.protocol === PROTOCOL.SERVICE) {
+      if (packet.transportProtocol === TRANSPORT_PROTOCOL.RegistrationRequest) {
+        return await this.handleRegistration(context, packet, addr, tcpSender);
+      }
+    } else if (packet.protocol === PROTOCOL.CONTROL) {
+      if (packet.transportProtocol === TRANSPORT_PROTOCOL.AddrRequest) {
+        return this.handleAddrRequest(addr);
+      }
+    }
+
+    // 返回错误，表示需要先建立上下文
+    return this.createErrorPacket(addr, packet.source, "No context");
+  }
+
+  async handleHandshake(packet, addr) {
+    try {
+      console.log(`[调试] === 握手开始 ===`);
+
+      const payload = packet.payload();
+      const handshakeReq = this.parseHandshakeRequest(payload);
+
+      console.log(`[调试] 客户端握手请求:`, handshakeReq);
+
+      const response = this.createHandshakeResponse(handshakeReq);
+
+      // 确保响应使用 SERVICE 协议
+      response.set_protocol(PROTOCOL.SERVICE);
+      response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);
+
+      // 使用默认网关
+      const defaultGateway = 0x0a240001; // 10.36.0.1
+      this.setCommonParams(response, packet.source, defaultGateway);
+
+      // 修改最终缓冲区的 TTL
+      const finalBuffer = response.buffer();
+      const view = new DataView(finalBuffer.buffer || finalBuffer);
+      const currentTtl = view.getUint8(3);
+      console.log(
+        `[调试] 发送前 TTL 检查: 0x${currentTtl.toString(16).padStart(2, "0")}`
+      );
+
+      // 强制设置 TTL 为 0xff (原始TTL=15, 当前TTL=15)
+      view.setUint8(3, 0xff);
+      console.log(`[调试] 强制修复 TTL 为: 0xff`);
+
+      console.log(
+        `[调试] 握手响应协议: ${response.protocol}, 传输: ${response.transportProtocol}`
+      );
+      console.log(`[调试] 握手响应网关: ${this.formatIp(defaultGateway)}`);
+      console.log(`[调试] === 握手结束 ===`);
+
+      return response;
+    } catch (error) {
+      console.error("[调试] 握手错误:", error);
+      return this.createErrorPacket(addr, packet.source, "握手失败");
+    }
+  }
+
+  async handleSecretHandshake(context, packet, addr) {
+    console.log(`Secret handshake from ${addr}`);
+
+    // 这里应该实现 RSA 解密和 AES 密钥交换
+    // 简化实现，实际需要完整的加密逻辑
+    try {
+      const response = NetPacket.new_encrypt(ENCRYPTION_RESERVED);
+      response.set_protocol(PROTOCOL.SERVICE);
+      response.set_transport_protocol(
+        TRANSPORT_PROTOCOL.SecretHandshakeResponse
+      );
+      this.setCommonParams(response, packet.source);
+
+      // 创建加密会话（简化）
+      const cipher = new AesGcmCipher(this.generateRandomKey());
+      context.server_cipher = cipher;
+      this.cache.cipher_session.set(addr, cipher);
+
+      return response;
+    } catch (error) {
+      console.error("Secret handshake error:", error);
+      return this.createErrorPacket(
+        addr,
+        packet.source,
+        "Secret handshake failed"
+      );
+    }
+  }
+
+  async handleRegistration(context, packet, addr, tcpSender) {
+    console.log(`[DEBUG] Registration request received`);
+    try {
+      const payload = packet.payload();
+      const registrationReq = this.parseRegistrationRequest(payload);
+
+      // 获取客户端请求的IP
+      const requestedIp = registrationReq.virtual_ip || 0;
+
+      // 创建或获取网络信息
+      const networkInfo = this.getOrCreateNetworkInfo(
+        registrationReq.token,
+        requestedIp
+      );
+
+      // 分配虚拟 IP - 如果客户端指定了IP就直接使用，否则分配新的
+      const virtualIp =
+        requestedIp !== 0
+          ? requestedIp
+          : this.allocateVirtualIp(networkInfo, registrationReq.device_id);
+      console.log(
+        `[DEBUG] Allocated IP: ${this.formatIp(
+          virtualIp
+        )}, 网关: ${this.formatIp(networkInfo.gateway)}`
+      );
+
+      // 创建客户端信息
+      const clientInfo = new ClientInfo({
+        virtual_ip: virtualIp,
+        device_id: registrationReq.device_id,
+        name: registrationReq.name,
+        version: registrationReq.version,
+        online: true,
+        address: addr,
+        client_secret_hash: registrationReq.client_secret_hash,
+        tcp_sender: tcpSender,
+        timestamp: Date.now(),
+      });
+
+      // 添加到网络
+      networkInfo.clients.set(virtualIp, clientInfo);
+      networkInfo.epoch += 1;
+
+      // 创建链接上下文
+      context.link_context = {
+        group: registrationReq.token,
+        virtual_ip: virtualIp,
+        network_info: networkInfo,
+        timestamp: Date.now(),
+      };
+
+      // 创建注册响应
+      const response = this.createRegistrationResponse(virtualIp, networkInfo);
+      console.log(
+        `[DEBUG] Sending registration response: IP=${this.formatIp(
+          virtualIp
+        )}, Gateway=${this.formatIp(networkInfo.gateway)}`
+      );
+      return response;
+    } catch (error) {
+      console.error("Registration error:", error);
+      return this.createErrorPacket(addr, packet.source, "Registration failed");
+    }
+  }
+
+  async handlePing(packet, linkContext) {
+    // 立即处理，不经过队列
+    const currentTime = Date.now() & 0xffff; // 取低16位
+
+    // 创建 Pong 响应
+    const pongPacket = this.createPongPacket(packet, currentTime);
+
+    // 直接发送响应，不经过广播
+    const sourceClient = linkContext.clients.get(packet.source.toString());
+    if (sourceClient && sourceClient.tcpSender) {
+      await sourceClient.tcpSender.send(pongPacket.buffer);
+    }
+
+    return null;
+  }
+
+  createPongPacket(pingPacket, currentTime) {
+    const headerSize = 12;
+    const payload = new Uint8Array(2); // 时间戳
+    const view = new DataView(payload.buffer);
+    view.setUint16(0, currentTime, false); // 大端序
+
+    const buffer = new Uint8Array(headerSize + payload.length);
+    buffer[0] = 2; // Version
+    buffer[1] = PROTOCOL.CONTROL;
+    buffer[2] = TRANSPORT_PROTOCOL.Pong;
+    buffer[3] = 0xf0; // MAX_TTL
+
+    // 交换源和目标
+    const sourceBytes = pingPacket.destination.split(".").map(Number);
+    const destBytes = pingPacket.source.split(".").map(Number);
+    buffer.set(sourceBytes, 4);
+    buffer.set(destBytes, 8);
+
+    buffer.set(payload, headerSize);
+
+    return {
+      protocol: PROTOCOL.CONTROL,
+      transportProtocol: TRANSPORT_PROTOCOL.Pong,
+      source: pingPacket.destination,
+      destination: pingPacket.source,
+      buffer,
+    };
+  }
+
+  handleAddrRequest(addr) {
+    const responseSize = 6 + ENCRYPTION_RESERVED;
+    const response = NetPacket.new_encrypt(responseSize);
+
+    response.set_protocol(PROTOCOL.CONTROL);
+    response.set_transport_protocol(TRANSPORT_PROTOCOL.AddrResponse);
+
+    // 设置地址信息
+    const addrPayload = response.payload_mut();
+    const view = new DataView(addrPayload.buffer, addrPayload.byteOffset);
+
+    // 解析 IPv4 地址
+    const ipv4 = this.parseIpv4(addr.ip);
+    view.setUint32(0, ipv4, true);
+    view.setUint16(4, addr.port || 0, true);
+
+    return response;
+  }
+
+  async handleDataForward(context, packet, addr, tcpSender) {
+    // 增加 TTL
+    if (packet.incr_ttl() > 1) {
+      // 检查是否禁用中继
+      if (this.env.VNT_DISABLE_RELAY === "1") {
+        console.log("Relay disabled, dropping packet");
+        return null;
+      }
+
+      const destination = packet.destination;
+
+      if (this.isBroadcast(destination)) {
+        return await this.broadcastPacket(context.link_context, packet);
+      } else {
+        return await this.forwardToDestination(
+          context.link_context,
+          packet,
+          destination
+        );
+      }
+    }
+    return null;
+  }
+
+  async handleClientPacket(context, packet, addr) {
+    if (!context.link_context) {
+      // 处理服务协议
+      if (packet.protocol === PROTOCOL.SERVICE) {
+        switch (packet.transportProtocol) {
+          case TRANSPORT_PROTOCOL.HandshakeRequest:
+            return await this.handleHandshake(packet, addr);
+          case TRANSPORT_PROTOCOL.RegistrationRequest:
+            return await this.handleRegistration(context, packet, addr, null);
+          default:
+            break;
+        }
+      }
+      // 移除默认握手响应，改为错误响应
+      return this.createErrorPacket(
+        addr,
+        packet.source,
+        "Invalid packet sequence"
+      );
+    }
+
+    return await this.forwardPacket(context.link_context, packet);
+  }
+
+  async forwardPacket(linkContext, packet) {
+    const destination = packet.destination;
+
+    if (this.isBroadcast(destination)) {
+      return await this.broadcastPacket(linkContext, packet);
+    } else {
+      const targetClient = linkContext.network_info.clients.get(destination);
+      if (targetClient && targetClient.online && targetClient.tcp_sender) {
+        // 发送到特定客户端
+        try {
+          await targetClient.tcp_sender.send(packet.buffer().to_vec());
+        } catch (error) {
+          console.error("Forward failed:", error);
+          targetClient.online = false;
+        }
+      }
+    }
+    return null;
+  }
+
+  async broadcastPacket(linkContext, packet) {
+    const networkInfo = linkContext.network_info;
+    const sender = packet.source;
+
+    for (const [virtualIp, client] of networkInfo.clients) {
+      if (client.virtual_ip !== sender && client.online && client.tcp_sender) {
+        try {
+          await client.tcp_sender.send(packet.buffer().to_vec());
+        } catch (error) {
+          console.error(`Broadcast to ${virtualIp} failed:`, error);
+          client.online = false;
+        }
+      }
+    }
+    return null;
+  }
+
+  async forwardToDestination(linkContext, packet, destination) {
+    const targetClient = linkContext.network_info.clients.get(destination);
+    if (targetClient && targetClient.online && targetClient.tcp_sender) {
+      try {
+        await targetClient.tcp_sender.send(packet.buffer().to_vec());
+      } catch (error) {
+        console.error(`Forward to ${destination} failed:`, error);
+        targetClient.online = false;
+      }
+    }
+    return null;
+  }
+
+  async leave(context) {
+    await context.leave(this.cache);
+  }
+
+  // 辅助方法
+  setCommonParams(packet, source, gateway) {
+    packet.set_default_version();
+    packet.set_destination(source);
+    packet.set_source(0x0a240001);
+    packet.first_set_ttl(15); // MAX_TTL = 0b1111 = 15
+    packet.set_gateway_flag(true);
+  }
+
+  // 计算客户端地址的方法
+  calculateClientAddress(source) {
+    // 根据原始实现，客户端地址应该基于某种算法计算
+    // 这里暂时使用 source，但可能需要根据实际协议调整
+    return source;
+  }
+
+  createErrorPacket(addr, destination, message) {
+    try {
+      console.log(`[DEBUG] Creating error packet: ${message}`);
+
+      const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);
+
+      // 设置协议字段
+      errorPacket.set_protocol(PROTOCOL.ERROR);
+      errorPacket.set_destination(destination);
+      errorPacket.set_source(this.serverPeerId);
+
+      // 尝试设置错误消息（如果协议支持）
+      try {
+        const errorPayload = new TextEncoder().encode(
+          message.substring(0, 100)
+        ); // 限制长度
+        errorPacket.set_payload(errorPayload);
+      } catch (payloadError) {
+        console.warn(`[DEBUG] Failed to set error payload:`, payloadError);
+      }
+
+      return errorPacket;
+    } catch (error) {
+      console.error("Failed to create error packet:", error);
+      // 返回一个基本的错误包
+      const fallbackPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);
+      fallbackPacket.set_protocol(PROTOCOL.ERROR);
+      fallbackPacket.set_source(this.serverPeerId);
+      return fallbackPacket;
+    }
+  }
+
+  createHandshakeResponse(request) {
+    const clientVersion = request.version || "1.2.16";
+
+    const responseData = {
+      version: clientVersion,
+      secret: false,
+      public_key: new Uint8Array(0),
+      key_finger: "",
+    };
+
+    const responseBytes = this.encodeHandshakeResponse(responseData);
+
+    // 使用普通数据包而不是加密数据包
+    const response = NetPacket.new(responseBytes.length);
+
+    response.set_protocol(PROTOCOL.SERVICE);
+    response.set_transport_protocol(TRANSPORT_PROTOCOL.HandshakeResponse);
+    response.set_payload(responseBytes);
+
+    return response;
+  }
+
+  createRegistrationResponse(virtualIp, networkInfo) {
+    const responseData = {
+      virtual_ip: virtualIp,
+      virtual_gateway: networkInfo.gateway,
+      virtual_netmask: networkInfo.netmask,
+      epoch: networkInfo.epoch,
+      // 过滤掉未完全初始化的客户端
+      device_info_list: Array.from(networkInfo.clients.values())
+        .filter((client) => client.virtual_ip !== 0 && client.online) // 只显示有效IP的在线客户端
+        .map((client) => ({
+          name: client.name,
+          virtual_ip: client.virtual_ip,
+          device_status: client.online ? 1 : 0,
+          client_secret: false,
+          client_secret_hash: new Uint8Array(0),
+          wireguard: false,
+        })),
+      public_ip: networkInfo.public_ip,
+      public_port: networkInfo.public_port,
+      public_ipv6: new Uint8Array(0),
+    };
+
+    const responseBytes = this.encodeRegistrationResponse(responseData);
+    const response = NetPacket.new(responseBytes.length);
+    response.set_default_version();
+
+    response.set_protocol(PROTOCOL.SERVICE);
+    response.set_transport_protocol(TRANSPORT_PROTOCOL.RegistrationResponse);
+
+    response.set_source(networkInfo.gateway); // 设置源地址为网关
+    response.set_destination(0xffffffff); // 设置目标地址为客户端
+    response.set_gateway_flag(true); // 设置网关标志
+    response.first_set_ttl(15);
+
+    response.set_payload(responseBytes);
+
+    return response;
+  }
+
+  // 协议解析方法
+  parseHandshakeRequest(payload) {
+    const { parseHandshakeRequest } = require("./protos.js");
+    try {
+      return parseHandshakeRequest(payload);
+    } catch (error) {
+      console.error("Failed to parse handshake request:", error);
+      throw new Error("Invalid handshake request format");
+    }
+  }
+
+  parseRegistrationRequest(payload) {
+    const { parseRegistrationRequest } = require("./protos.js");
+    try {
+      return parseRegistrationRequest(payload);
+    } catch (error) {
+      console.error("Failed to parse registration request:", error);
+      throw new Error("Invalid registration request format");
+    }
+  }
+
+  encodeHandshakeResponse(data) {
+    const { createHandshakeResponse } = require("./protos.js");
+    return createHandshakeResponse(
+      data.version,
+      data.secret,
+      data.public_key,
+      data.key_finger
+    );
+  }
+
+  encodeRegistrationResponse(data) {
+    const { createRegistrationResponse } = require("./protos.js");
+    return createRegistrationResponse(
+      data.virtual_ip,
+      data.virtual_gateway,
+      data.virtual_netmask,
+      data.epoch,
+      data.device_info_list,
+      data.public_ip,
+      data.public_port
+    );
+  }
+
+  validateRegistrationRequest(request) {
+    if (
+      !request.token ||
+      request.token.length === 0 ||
+      request.token.length > 128
+    ) {
+      throw new Error("Invalid token length");
+    }
+    if (
+      !request.device_id ||
+      request.device_id.length === 0 ||
+      request.device_id.length > 128
+    ) {
+      throw new Error("Invalid device_id length");
+    }
+    if (
+      !request.name ||
+      request.name.length === 0 ||
+      request.name.length > 128
+    ) {
+      throw new Error("Invalid name length");
+    }
+  }
+
+  parseIpv4(ipStr) {
+    if (!ipStr || typeof ipStr !== "string") {
+      return 0;
+    }
+    const parts = ipStr.split(".").map(Number);
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+  }
+
+  isBroadcast(addr) {
+    return addr === 0xffffffff || addr === 0;
+  }
+
+  generateRandomKey() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return array;
+  }
+
+  // 网络管理方法
+  getOrCreateNetworkInfo(token, requestedIp = 0) {
+    if (!this.cache.networks.has(token)) {
+      let gateway = 0x0a240001; // 默认 10.36.0.1
+      let network = 0x0a240001; // 默认 10.36.0.0
+      let netmask = 0xffffff00; // 255.255.255.0
+
+      // 如果第一个客户端指定了IP，根据其更新网段
+      if (requestedIp !== 0) {
+        network = requestedIp & netmask;
+        console.log(
+          `[DEBUG] 客户端网段更新: 网关=${this.formatIp(
+            gateway
+          )}, 网络=${this.formatIp(network)}`
+        );
+      }
+
+      this.cache.networks.set(
+        token,
+        new NetworkInfo(network, netmask, gateway)
+      );
+    }
+    return this.cache.networks.get(token);
+  }
+
+  // 辅助方法：格式化 IP 地址用于日志
+  formatIp(ipUint32) {
+    return `${(ipUint32 >>> 24) & 0xff}.${(ipUint32 >>> 16) & 0xff}.${
+      (ipUint32 >>> 8) & 0xff
+    }.${ipUint32 & 0xff}`;
+  }
+
+  allocateVirtualIp(networkInfo, deviceId) {
+    // 简单的 IP 分配策略：从 10.0.0.2 开始分配
+    const baseIp = (networkInfo.network & 0xffffff00) + 2;
+    let currentIp = baseIp;
+
+    while (networkInfo.clients.has(currentIp)) {
+      currentIp++;
+      // 防止超出子网范围
+      if ((currentIp & 0xff) > 254) {
+        throw new Error("No available IP addresses");
+      }
+    }
+
+    return currentIp;
+  }
+  validatePacket(packet) {
+    const buffer = packet.buffer();
+
+    // 修复：确保转换为 ArrayBuffer
+    let arrayBuffer;
+    if (buffer instanceof ArrayBuffer) {
+      arrayBuffer = buffer;
+    } else if (buffer.buffer) {
+      arrayBuffer = buffer.buffer;
+    } else {
+      arrayBuffer = buffer.buffer.slice(
+        buffer.byteOffset,
+        buffer.byteOffset + buffer.byteLength
+      );
+    }
+
+    const view = new DataView(arrayBuffer);
+
+    console.log(
+      `[DEBUG] Complete packet hex:`,
+      Array.from(buffer)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")
+    );
+
+    // 验证地址字段
+    const sourceBytes = [
+      view.getUint8(4),
+      view.getUint8(5),
+      view.getUint8(6),
+      view.getUint8(7),
+    ];
+    const destBytes = [
+      view.getUint8(8),
+      view.getUint8(9),
+      view.getUint8(10),
+      view.getUint8(11),
+    ];
+
+    console.log(`[DEBUG] Packet source: [${sourceBytes.join(", ")}]`);
+    console.log(`[DEBUG] Packet dest: [${destBytes.join(", ")}]`);
+  }
 }
