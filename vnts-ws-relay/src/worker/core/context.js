@@ -182,7 +182,11 @@ export class NetworkInfo {
     this.netmask = netmask;
     this.gateway = gateway;
     this.clients = new Map();
-    this.epoch = 0;
+    this.public_ip = new Uint8Array(4);  
+    this.public_port = 0;  
+    this.epoch = 0;  
+    this.last_update = Date.now();  
+    this.cipher_policy = null;
   }
 
   static new(network, netmask, gateway) {

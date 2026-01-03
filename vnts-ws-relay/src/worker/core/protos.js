@@ -123,7 +123,9 @@ export function createRegistrationRequest(
   name,
   version,
   virtualIp,
-  clientSecretHash
+  clientSecretHash,  
+  password,  
+  cipherModel
 ) {
   if (!token) {
     throw new Error("Token is required for registration");
@@ -136,8 +138,10 @@ export function createRegistrationRequest(
     version: version || "Unknown",
     virtual_ip: virtualIp || 0,
     allow_ip_change: false,
-    client_secret: false,
-    client_secret_hash: clientSecretHash || new Uint8Array(0),
+    client_secret: false,  
+    client_secret_hash: clientSecretHash || new Uint8Array(0),  
+    password: password || "",  
+    cipher_model: cipherModel || "aes_gcm",
   };
   return encodeRegistrationRequest(message);
 }
@@ -274,3 +278,36 @@ export function parseClientStatusInfo(data) {
 export function parseRouteItem(data) {
   return decodeRouteItem(data);
 }
+// 导出编码/解码函数  
+export {  
+  encodeHandshakeRequest,  
+  decodeHandshakeRequest,  
+  encodeHandshakeResponse,  
+  decodeHandshakeResponse,  
+  encodeSecretHandshakeRequest,  
+  decodeSecretHandshakeRequest,  
+  // SecretHandshakeResponse 可能不存在，先注释掉  
+  // encodeSecretHandshakeResponse,  
+  // decodeSecretHandshakeResponse,  
+  encodeRegistrationRequest,  
+  decodeRegistrationRequest,  
+  encodeRegistrationResponse,  
+  decodeRegistrationResponse,  
+  encodeDeviceInfo,  
+  decodeDeviceInfo,  
+  encodeDeviceList,  
+  decodeDeviceList,  
+  encodePunchInfo,  
+  decodePunchInfo,  
+  encodeClientStatusInfo,  
+  decodeClientStatusInfo,  
+  encodeRouteItem,  
+  decodeRouteItem,  
+  encodePunchNatType,  
+  decodePunchNatType,  
+  encodePunchNatModel,  
+  decodePunchNatModel,  
+} from "./protos_generated.js";  
+  
+// 导出 createErrorPacket 函数（在 protos.js 中定义）  
+export { createErrorPacket };
