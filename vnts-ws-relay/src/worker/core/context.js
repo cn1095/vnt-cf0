@@ -208,7 +208,7 @@ export class NetworkInfo {
 export class ClientInfo {
   constructor(options = {}) {
     this.virtual_ip = options.virtualIp || 0;
-    this.device_id = options.deviceId || "";
+    this.device_id = options.device_id || "";
     this.name = options.name || "";
     this.version = options.version || "";
     this.wireguard = options.wireguard || null;

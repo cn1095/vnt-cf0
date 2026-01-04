@@ -698,11 +698,13 @@ export class PacketHandler {
     return response;
   }
   async notifyClientsUpdate(networkInfo, newClientIp, newClientInfo) {  
+  logger.info(`[通知-开始] 通知客户端更新，新客户端IP: ${this.formatIp(newClientIp)}`);
     const updatePacket = this.createDeviceUpdatePacket(networkInfo, newClientInfo);  
   
     // 向所有已连接的客户端发送更新  
     for (const [ip, client] of networkInfo.clients) {  
-        if (ip !== newClientIp && client.online) {  
+        if (ip !== newClientIp && client.online) {
+        logger.info(`[通知-发送] 向客户端 ${this.formatIp(ip)} 发送更新`);  
             try {  
                 // 通过 RelayRoom 的 connections Map 获取实际的 WebSocket  
                 if (this.relayRoom && this.relayRoom.connections) {  
@@ -765,37 +767,70 @@ export class PacketHandler {
       // 更新网段信息（如果是第一个客户端且指定了IP）
       this.updateNetworkSegment(networkInfo, requestedIp, networkInfo.netmask);
       
-      // 新增：检查设备ID是否已被其他IP使用  
-        const existingDeviceWithSameId = this.findDeviceById(networkInfo, deviceId);  
-        if (existingDeviceWithSameId && existingDeviceWithSameId.online) {  
-            if (requestedIp !== 0 && existingDeviceWithSameId.virtual_ip !== requestedIp) {  
-                // 设备ID已被其他IP占用，且请求的IP不同  
-                logger.warn(  
-                    `[ID冲突-已占用] 设备ID ${deviceId} 已被IP ${this.formatIp(existingDeviceWithSameId.virtual_ip)} 占用`  
-                );  
-                return this.createDeviceIdAlreadyInUsePacket(addr, packet.source, existingDeviceWithSameId.virtual_ip);  
+      // 检查设备ID是否在线 - 不抛出错误，记录日志并返回错误包  
+    logger.info(`[注册-检查] 开始检查设备ID是否在线: ${deviceId}`);  
+    const existingDeviceWithSameId = this.findDeviceById(networkInfo, deviceId);    
+    if (existingDeviceWithSameId && existingDeviceWithSameId.online) {    
+        // 设备ID在线，记录警告日志并返回错误包  
+        logger.warn(    
+            `[ID冲突-在线] 设备ID ${deviceId} 已被其他客户端使用，IP: ${this.formatIp(existingDeviceWithSameId.virtual_ip)}`    
+        );    
+        const errorMessage = `ID在线 已被使用 设备名：${existingDeviceWithSameId.name} 设备IP：${this.formatIp(existingDeviceWithSameId.virtual_ip)}`;  
+        const errorPayload = new TextEncoder().encode(errorMessage);  
+        const errorPacket = NetPacket.new_encrypt(12 + errorPayload.length + ENCRYPTION_RESERVED);  
+          
+        errorPacket.set_protocol(PROTOCOL.ERROR);  
+        errorPacket.set_transport_protocol(4); // IpAlreadyExists  
+        errorPacket.set_source(packet.source);  
+        errorPacket.set_destination(0xffffffff);  
+        errorPacket.set_payload(errorPayload);  
+          
+        logger.info(`[注册-响应] 返回设备ID冲突错误包给客户端`);  
+        return errorPacket;  
+    }  
+  
+    // 检查IP是否已被其他设备ID使用 - 不抛出错误，记录日志并返回错误包  
+    if (requestedIp !== 0) {    
+        logger.info(`[注册-检查] 开始检查IP冲突: ${this.formatIp(requestedIp)}`);  
+        const existingClient = networkInfo.clients.get(requestedIp);    
+        if (existingClient && existingClient.online) {    
+            if (existingClient.device_id !== deviceId) {    
+                // IP被其他设备ID占用，记录警告日志并返回错误包  
+                logger.warn(    
+                    `[IP冲突-其他设备] IP ${this.formatIp(requestedIp)} 被其他设备 ${existingClient.device_id} 占用，当前设备: ${deviceId}`    
+                );    
+                const errorMessage = `IP已被使用 设备名：${existingClient.name} 设备ID：${existingClient.device_id}`;  
+                const errorPayload = new TextEncoder().encode(errorMessage);  
+                const errorPacket = NetPacket.new_encrypt(12 + errorPayload.length + ENCRYPTION_RESERVED);  
+                  
+                errorPacket.set_protocol(PROTOCOL.ERROR);  
+                errorPacket.set_transport_protocol(4); // IpAlreadyExists  
+                errorPacket.set_source(packet.source);  
+                errorPacket.set_destination(0xffffffff);  
+                errorPacket.set_payload(errorPayload);  
+                  
+                logger.info(`[注册-响应] 返回IP冲突错误包给客户端`);  
+                return errorPacket;  
+            } else if (existingClient.device_id === deviceId) {    
+                // 相同设备ID和IP，且在线，记录警告日志并返回错误包  
+                logger.warn(    
+                    `[IP冲突-已占用] IP ${this.formatIp(requestedIp)} 已被设备 ${deviceId} 占用（重复连接）`    
+                );    
+                const errorMessage = `IP已被使用 设备名：${existingClient.name} 设备ID：${existingClient.device_id}`;  
+                const errorPayload = new TextEncoder().encode(errorMessage);  
+                const errorPacket = NetPacket.new_encrypt(12 + errorPayload.length + ENCRYPTION_RESERVED);  
+                  
+                errorPacket.set_protocol(PROTOCOL.ERROR);  
+                errorPacket.set_transport_protocol(4); // IpAlreadyExists  
+                errorPacket.set_source(packet.source);  
+                errorPacket.set_destination(0xffffffff);  
+                errorPacket.set_payload(errorPayload);  
+                  
+                logger.info(`[注册-响应] 返回IP重复占用错误包给客户端`);  
+                return errorPacket;  
             }  
         }  
-  
-        // 新增：检查IP是否已被其他设备ID使用  
-        if (requestedIp !== 0) {  
-            const existingClient = networkInfo.clients.get(requestedIp);  
-            if (existingClient && existingClient.online) {  
-                if (existingClient.device_id !== deviceId) {  
-                    // IP被其他设备ID占用  
-                    logger.warn(  
-                        `[IP冲突-其他设备] IP ${this.formatIp(requestedIp)} 被其他设备 ${existingClient.device_id} 占用`  
-                    );  
-                    return this.createIpAlreadyInUsePacket(addr, packet.source, requestedIp);  
-                } else if (existingClient.device_id === deviceId) {  
-                    // 相同设备ID和IP，且在线，返回已被使用错误  
-                    logger.warn(  
-                        `[IP冲突-已占用] IP ${this.formatIp(requestedIp)} 已被设备 ${deviceId} 占用`  
-                    );  
-                    return this.createIpAlreadyInUsePacket(addr, packet.source, requestedIp);  
-                }  
-            }  
-        }
+    } 
 
       let virtualIp = requestedIp;
 
@@ -872,46 +907,23 @@ export class PacketHandler {
   }
   
   // 根据设备ID查找客户端  
-findDeviceById(networkInfo, deviceId) {  
-    for (const [ip, client] of networkInfo.clients) {  
-        if (client.device_id === deviceId && client.online) {  
-            return client;  
-        }  
-    }  
-    return null;  
-}  
-  
-// 创建IP已被使用的错误响应包  
-createIpAlreadyInUsePacket(addr, source, requestedIp) {  
-    const errorPayload = new TextEncoder().encode(  
-        `IP ${this.formatIp(requestedIp)} is already in use`  
-    );  
-    const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
+findDeviceById(networkInfo, deviceId) {    
+    logger.info(`[设备查找] 查找设备ID: ${deviceId}`);  
+    logger.info(`[设备查找] 当前网络客户端数量: ${networkInfo.clients.size}`);  
       
-    errorPacket.set_protocol(PROTOCOL.SERVICE);  
-    errorPacket.set_transport_protocol(TRANSPORT_PROTOCOL.ErrorResponse);  
-    errorPacket.set_source(source);  
-    errorPacket.set_destination(0xffffffff);  
-    errorPacket.set_payload(errorPayload);  
+    // 遍历所有客户端，打印详细信息  
+    for (const [ip, client] of networkInfo.clients) {    
+        logger.info(`[设备查找] 检查客户端 IP: ${this.formatIp(ip)}, 设备ID: ${client.device_id}, 在线状态: ${client.online}`);  
+          
+        if (client.device_id === deviceId && client.online) {    
+            logger.info(`[设备查找] 找到在线设备: ${deviceId}，IP: ${this.formatIp(ip)}`);  
+            return client;    
+        }    
+    }    
       
-    return errorPacket;  
-}  
-  
-// 创建设备ID已被使用的错误响应包  
-createDeviceIdAlreadyInUsePacket(addr, source, existingIp) {  
-    const errorPayload = new TextEncoder().encode(  
-        `Device ID is already in use with IP ${this.formatIp(existingIp)}`  
-    );  
-    const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);  
-      
-    errorPacket.set_protocol(PROTOCOL.SERVICE);  
-    errorPacket.set_transport_protocol(TRANSPORT_PROTOCOL.ErrorResponse);  
-    errorPacket.set_source(source);  
-    errorPacket.set_destination(0xffffffff);  
-    errorPacket.set_payload(errorPayload);  
-      
-    return errorPacket;  
-}  
+    logger.info(`[设备查找] 未找到在线设备: ${deviceId}`);  
+    return null;    
+}
 
   getCachedEpoch() {
     if (!this.cachedEpoch || Date.now() - this.lastEpochUpdate > 5000) {
@@ -1131,37 +1143,33 @@ createDeviceIdAlreadyInUsePacket(addr, source, existingIp) {
     return clientAddress;
   }
 
-  createErrorPacket(addr, destination, message) {
-    try {
-      // logger.debug(`[错误包-创建] 开始创建错误包: ${message}`);
-
-      const errorPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);
-
-      // 设置协议字段
-      errorPacket.set_protocol(PROTOCOL.ERROR);
-      errorPacket.set_destination(destination);
-      errorPacket.set_source(this.serverPeerId);
-
-      // 尝试设置错误消息（如果协议支持）
-      try {
-        const errorPayload = new TextEncoder().encode(
-          message.substring(0, 100)
-        ); // 限制长度
-        errorPacket.set_payload(errorPayload);
-      } catch (payloadError) {
-        // logger.warn(`[错误包-警告] 设置错误载荷失败: ${payloadError.message}`);
-      }
-
-      return errorPacket;
-    } catch (error) {
-      // logger.error(`[错误包-失败] 创建错误包失败: ${error.message}`, error);
-      // 返回一个基本的错误包
-      const fallbackPacket = NetPacket.new_encrypt(ENCRYPTION_RESERVED);
-      fallbackPacket.set_protocol(PROTOCOL.ERROR);
-      fallbackPacket.set_source(this.serverPeerId);
-      return fallbackPacket;
-    }
-  }
+  createErrorPacket(addr, destination, message) {  
+    try {  
+        logger.info(`[错误包-创建] 开始创建错误包: ${message}`);  
+  
+        const errorPayload = new TextEncoder().encode(message.substring(0, 100));  
+          
+        // 修复：计算所需空间  
+        const requiredSize = 12 + errorPayload.length + ENCRYPTION_RESERVED;  
+        const errorPacket = NetPacket.new_encrypt(requiredSize);  
+  
+        // 设置协议字段  
+        errorPacket.set_protocol(PROTOCOL.ERROR);  
+        errorPacket.set_destination(destination);  
+        errorPacket.set_source(this.serverPeerId || 0);  
+        errorPacket.set_payload(errorPayload);  
+  
+        logger.info(`[错误包-创建] 错误包创建完成，大小: ${requiredSize}字节`);  
+        return errorPacket;  
+    } catch (error) {  
+        logger.error(`[错误包-失败] 创建错误包失败: ${error.message}`, error);  
+        // 返回一个基本的错误包  
+        const fallbackPacket = NetPacket.new_encrypt(12 + ENCRYPTION_RESERVED);  
+        fallbackPacket.set_protocol(PROTOCOL.ERROR);  
+        fallbackPacket.set_source(this.serverPeerId || 0);  
+        return fallbackPacket;  
+    }  
+}
 
   createHandshakeResponse(request) {
     // logger.debug(`[握手响应-开始] 开始创建握手响应`);
@@ -1429,13 +1437,21 @@ createDeviceIdAlreadyInUsePacket(addr, source, existingIp) {
 
     // 1. 检查设备ID重用 - 查找上一次使用的IP
     // logger.debug(`[IP分配-重用] 检查设备ID重用: ${deviceId}`);
-    for (const [ip, client] of networkInfo.clients) {
-      if (client.device_id === deviceId) {
-        virtualIp = ip;
-        insert = false;
-        // logger.info(`[IP分配-重用] 找到设备之前使用的IP: ${this.formatIp(virtualIp)}`);
-        break;
-      }
+    for (const [ip, client] of networkInfo.clients) {  
+        if (client.device_id === deviceId) {  
+            // 修复：必须检查客户端是否在线  
+            if (client.online) {  
+                // 设备在线，不能重用，应该返回错误  
+                logger.error(`[IP分配-冲突] 设备ID ${deviceId} 已在线，IP: ${this.formatIp(ip)}`);  
+                throw new Error(`Device ID ${deviceId} is already online`);  
+            } else {  
+                // 设备离线，可以重用IP  
+                virtualIp = ip;  
+                insert = false;  
+                logger.info(`[IP分配-重用] 找到离线设备之前使用的IP: ${this.formatIp(virtualIp)}`);  
+                break;  
+            }  
+        }  
     }
 
     // 2. 如果没有重用IP，分配新的IP
